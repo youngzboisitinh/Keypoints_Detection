@@ -1,11 +1,111 @@
 import cv2
 import numpy as np
+import math
 from ultralytics import YOLO
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from PIL import Image, ImageTk
 import threading
 
+# =======================
+# 1) Đặt hàm standalone classify_pose_flexible lên đây
+# =======================
+def classify_pose_flexible(keypoints):
+    """
+    Phân loại tư thế dựa trên keypoints người (x,y). Trả về 'standing', 'lying' hoặc 'unknown'.
+    keypoints: array có kích thước (N, 3) theo chuẩn YOLOv8 (x, y, confidence).
+    Chúng ta chỉ dùng x,y để tính toán.
+    """
+    # Lọc keypoints hợp lệ (loại bỏ giá trị None hoặc NaN)
+    data = []
+    for p in keypoints:
+        if p is None:
+            continue
+        # p có dạng (x, y, conf)
+        try:
+            x, y, _ = p  # chỉ lấy x,y, bỏ conf
+        except:
+            continue
+        if x is None or y is None or math.isnan(x) or math.isnan(y):
+            continue
+        data.append((x, y))
+    
+    if len(data) < 2:
+        # Quá ít điểm để xác định tư thế
+        return "unknown"
+    data = np.array(data, dtype=np.float32)
+    
+    # Tính khung giới hạn (bounding box) và aspect ratio
+    xs = data[:, 0]
+    ys = data[:, 1]
+    width = xs.max() - xs.min()
+    height = ys.max() - ys.min() + 1e-6  # tránh chia 0
+    aspect_ratio = width / height
+    
+    # Tính phương sai theo các chiều X, Y
+    var_x = np.var(xs)
+    var_y = np.var(ys)
+    var_ratio = var_x / (var_y + 1e-6)
+    
+    # PCA để tìm trục chính và góc với trục dọc
+    cov = np.cov(data.T)
+    if cov.shape == (2, 2):
+        eig_vals, eig_vecs = np.linalg.eig(cov)
+    else:
+        eig_vals = np.array([var_x, var_y])
+        eig_vecs = np.array([[1, 0], [0, 1]])
+    idx = np.argmax(eig_vals)
+    principal_vec = eig_vecs[:, idx]
+    norm_vec = principal_vec / (np.linalg.norm(principal_vec) + 1e-6)
+    angle_to_vertical = math.degrees(math.acos(abs(norm_vec[1])))
+    
+    # Tính góc thân (nếu có vai và hông)
+    trunk_angle = None
+    mp_indices = {
+        'left_shoulder': 11, 'right_shoulder': 12,
+        'left_hip': 23, 'right_hip': 24
+    }
+    if isinstance(keypoints, (list, tuple)) and len(keypoints) > max(mp_indices.values()):
+        try:
+            ls = keypoints[mp_indices['left_shoulder']]
+            rs = keypoints[mp_indices['right_shoulder']]
+            lh = keypoints[mp_indices['left_hip']]
+            rh = keypoints[mp_indices['right_hip']]
+            def get_xy(pt):
+                try:
+                    return (pt[0], pt[1])
+                except:
+                    return None
+            ls_xy = get_xy(ls)
+            rs_xy = get_xy(rs)
+            lh_xy = get_xy(lh)
+            rh_xy = get_xy(rh)
+            if ls_xy and rs_xy and lh_xy and rh_xy:
+                shoulder_mid = np.array([(ls_xy[0] + rs_xy[0]) * 0.5, (ls_xy[1] + rs_xy[1]) * 0.5])
+                hip_mid = np.array([(lh_xy[0] + rh_xy[0]) * 0.5, (lh_xy[1] + rh_xy[1]) * 0.5])
+                trunk_vec = hip_mid - shoulder_mid
+                trunk_vec = trunk_vec / (np.linalg.norm(trunk_vec) + 1e-6)
+                trunk_angle = math.degrees(math.acos(abs(trunk_vec[1])))
+        except Exception:
+            trunk_angle = None
+    
+    # Điều kiện quyết định tư thế
+    lying = False
+    if angle_to_vertical > 60:
+        lying = True
+    if var_ratio > 1.0:
+        lying = True
+    if aspect_ratio > 0.8:
+        lying = True
+    if trunk_angle is not None and trunk_angle > 45:
+        lying = True
+    
+    return "lying" if lying else "standing"
+
+
+# =======================
+# 2) Class GUI giữ nguyên, nhưng loại bỏ phần classify_pose_flexible cũ và gọi hàm standalone
+# =======================
 class AdvancedPoseGUI:
     def __init__(self, root):
         self.root = root
@@ -60,14 +160,12 @@ class AdvancedPoseGUI:
         # Original image
         self.original_frame = ttk.LabelFrame(image_frame, text="Original Image", padding="5")
         self.original_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), padx=(0, 5))
-        
         self.original_label = ttk.Label(self.original_frame, text="No image selected")
         self.original_label.pack(expand=True)
         
         # Processed image
         self.processed_frame = ttk.LabelFrame(image_frame, text="Processed Image", padding="5")
         self.processed_frame.grid(row=0, column=1, sticky=(tk.W, tk.E, tk.N, tk.S), padx=(5, 0))
-        
         self.processed_label = ttk.Label(self.processed_frame, text="No processed image")
         self.processed_label.pack(expand=True)
         
@@ -78,7 +176,6 @@ class AdvancedPoseGUI:
         self.results_text = tk.Text(results_frame, height=6, width=80)
         scrollbar = ttk.Scrollbar(results_frame, orient="vertical", command=self.results_text.yview)
         self.results_text.configure(yscrollcommand=scrollbar.set)
-        
         self.results_text.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
         
@@ -130,7 +227,6 @@ class AdvancedPoseGUI:
                 ("All files", "*.*")
             ]
         )
-        
         if file_path:
             try:
                 self.current_image = cv2.imread(file_path)
@@ -145,7 +241,6 @@ class AdvancedPoseGUI:
             image_rgb = cv2.cvtColor(display_image, cv2.COLOR_BGR2RGB)
             pil_image = Image.fromarray(image_rgb)
             photo = ImageTk.PhotoImage(pil_image)
-            
             self.original_label.config(image=photo, text="")
             self.original_label.image = photo
     
@@ -154,7 +249,6 @@ class AdvancedPoseGUI:
         image_rgb = cv2.cvtColor(display_image, cv2.COLOR_BGR2RGB)
         pil_image = Image.fromarray(image_rgb)
         photo = ImageTk.PhotoImage(pil_image)
-        
         self.processed_label.config(image=photo, text="")
         self.processed_label.image = photo
     
@@ -179,13 +273,13 @@ class AdvancedPoseGUI:
             messagebox.showwarning("Warning", "Please select an image first!")
             return
         
-        # Process in separate thread để GUI không bị treo
+        # Xử lý trong thread riêng để GUI không bị treo
         threading.Thread(target=self._process_image_thread, daemon=True).start()
     
     def _process_image_thread(self):
         try:
             # 1) Chạy inference
-            results = self.model(self.current_image, conf=0.25, verbose=False)
+            results = self.model(self.current_image, conf=float(self.confidence_var.get()), verbose=False)
 
             # ======== Bắt đầu chèn debug ========
             for idx, result in enumerate(results):
@@ -215,16 +309,21 @@ class AdvancedPoseGUI:
                     detection_info.append(f"Detected {len(result.boxes)} person(s)")
 
                 if hasattr(result, 'keypoints') and result.keypoints is not None:
-                    keypoints_data = result.keypoints.data
+                    keypoints_data = result.keypoints.data  # tensor hình (n_person, 17, 3)
                     detection_info.append(f"Found {len(keypoints_data)} keypoint set(s)")
 
                     for i, person_keypoints in enumerate(keypoints_data):
-                        kpts = person_keypoints.cpu().numpy()
-                        visible_kpts = sum(1 for kp in kpts if kp[2] > 0.3)
-                        detection_info.append(f"Person {i+1}: {visible_kpts}/17 keypoints visible")
-
-                        pose_label, confidence_msg = self.classify_pose_flexible(kpts)
-                        pose_results.append(f"Person {i+1}: {pose_label} {confidence_msg}")
+                        kpts = person_keypoints.cpu().numpy()  # shape (17, 3)
+        
+                        # Chuyển từ normalized (0–1) sang pixel
+                        h, w = self.current_image.shape[:2]
+                        kpts_pixel = kpts.copy()
+                        kpts_pixel[:, 0] *= w
+                        kpts_pixel[:, 1] *= h
+                        
+                        # Gọi classifier với keypoints đã chuyển đổi
+                        pose_label = classify_pose_flexible(kpts_pixel)
+                        pose_results.append(f"Person {i+1}: {pose_label}")
 
                         processed_img = self.draw_keypoints(processed_img, kpts, pose_label, i)
                 else:
@@ -260,205 +359,10 @@ class AdvancedPoseGUI:
         
         self.log_result(result_text)
     
-    def classify_pose_flexible(self, keypoints):
-        """Improved flexible pose classification that works with partial keypoints"""
-        if len(keypoints) != 17:
-            return "Unknown", "(invalid keypoint format)"
-        
-        visibility_threshold = 0.25
-        visible_kpts = [i for i, kp in enumerate(keypoints) if kp[2] > visibility_threshold]
-        visible_count = len(visible_kpts)
-        
-        if visible_count < 3:
-            return "Insufficient data", f"(only {visible_count} keypoints)"
-        
-        visible_points = [(keypoints[i][0], keypoints[i][1]) for i in visible_kpts]
-        all_x = [p[0] for p in visible_points]
-        all_y = [p[1] for p in visible_points]
-        
-        bbox_width = max(all_x) - min(all_x)
-        bbox_height = max(all_y) - min(all_y)
-        aspect_ratio = bbox_width / (bbox_height + 1e-8)
-        
-        classification_scores = {
-            'lying': 0,
-            'standing': 0,
-            'sitting': 0,
-            'kneeling': 0
-        }
-        confidence_details = []
-        
-        # RULE 1: Aspect Ratio
-        if aspect_ratio > 1.4:
-            classification_scores['lying'] += 3
-            confidence_details.append(f"Wide AR:{aspect_ratio:.2f}")
-        elif aspect_ratio > 1.1:
-            classification_scores['lying'] += 1
-            confidence_details.append(f"Med AR:{aspect_ratio:.2f}")
-        elif aspect_ratio < 0.6:
-            classification_scores['standing'] += 2
-            confidence_details.append(f"Tall AR:{aspect_ratio:.2f}")
-        elif aspect_ratio < 0.8:
-            classification_scores['standing'] += 1
-            classification_scores['sitting'] += 1
-            confidence_details.append(f"Norm AR:{aspect_ratio:.2f}")
-        
-        # RULE 2: Body Orientation
-        torso_points = self.get_torso_keypoints(keypoints, visibility_threshold)
-        if torso_points:
-            torso_angle = self.calculate_torso_angle(torso_points)
-            if torso_angle is not None:
-                if torso_angle > 60:
-                    classification_scores['lying'] += 2
-                    confidence_details.append(f"H-torso:{torso_angle:.0f}°")
-                elif torso_angle < 20:
-                    classification_scores['standing'] += 1
-                    confidence_details.append(f"V-torso:{torso_angle:.0f}°")
-                else:
-                    classification_scores['sitting'] += 1
-                    confidence_details.append(f"A-torso:{torso_angle:.0f}°")
-        
-        # RULE 3: Leg Analysis
-        leg_analysis = self.analyze_legs(keypoints, visibility_threshold)
-        for pose, score in leg_analysis['scores'].items():
-            classification_scores[pose] += score
-        if leg_analysis['details']:
-            confidence_details.extend(leg_analysis['details'])
-        
-        # RULE 4: Vertical Position
-        head_body_analysis = self.analyze_head_body_positions(keypoints, visibility_threshold)
-        for pose, score in head_body_analysis['scores'].items():
-            classification_scores[pose] += score
-        if head_body_analysis['details']:
-            confidence_details.extend(head_body_analysis['details'])
-        
-        # RULE 5: Few Keypoints
-        if visible_count < 8:
-            if aspect_ratio > 1.2:
-                classification_scores['lying'] += 2
-            elif aspect_ratio < 0.7:
-                classification_scores['standing'] += 1
-            confidence_details.append(f"Few-pts:{visible_count}")
-        
-        max_score = max(classification_scores.values())
-        if max_score == 0:
-            return "Unknown", f"(no clear indicators, {visible_count} pts)"
-        
-        best_pose = max(classification_scores.items(), key=lambda x: x[1])[0]
-        confidence_level = "high" if max_score >= 3 else "medium" if max_score >= 2 else "low"
-        detail_str = ", ".join(confidence_details) if confidence_details else "basic detection"
-        
-        return best_pose.capitalize(), f"({confidence_level}, {detail_str})"
-    
-    def get_torso_keypoints(self, keypoints, threshold):
-        """Extract visible torso keypoints"""
-        torso_indices = [5, 6, 11, 12]
-        visible_torso = []
-        for idx in torso_indices:
-            if keypoints[idx][2] > threshold:
-                visible_torso.append((keypoints[idx][0], keypoints[idx][1], idx))
-        return visible_torso if len(visible_torso) >= 2 else None
-    
-    def calculate_torso_angle(self, torso_points):
-        """Calculate torso orientation angle"""
-        if len(torso_points) < 2:
-            return None
-        shoulders = [p for p in torso_points if p[2] in [5, 6]]
-        hips = [p for p in torso_points if p[2] in [11, 12]]
-        if not shoulders or not hips:
-            return None
-        
-        shoulder_center = np.mean([[p[0], p[1]] for p in shoulders], axis=0)
-        hip_center = np.mean([[p[0], p[1]] for p in hips], axis=0)
-        torso_vector = hip_center - shoulder_center
-        vertical_vector = np.array([0, 1])
-        
-        if np.linalg.norm(torso_vector) == 0:
-            return None
-        cos_angle = np.dot(torso_vector, vertical_vector) / np.linalg.norm(torso_vector)
-        cos_angle = np.clip(cos_angle, -1, 1)
-        angle = np.degrees(np.arccos(abs(cos_angle)))
-        return angle
-    
-    def analyze_legs(self, keypoints, threshold):
-        """Analyze leg positions for pose classification"""
-        scores = {'lying': 0, 'standing': 0, 'sitting': 0, 'kneeling': 0}
-        details = []
-        
-        left_leg = [(11, 13, 15), keypoints[11], keypoints[13], keypoints[15]]
-        right_leg = [(12, 14, 16), keypoints[12], keypoints[14], keypoints[16]]
-        leg_angles = []
-        
-        for leg_name, hip, knee, ankle in [("left", *left_leg[1:]), ("right", *right_leg[1:])]:
-            if all(kp[2] > threshold for kp in [hip, knee, ankle]):
-                angle = self.calculate_angle(hip[:2], knee[:2], ankle[:2])
-                leg_angles.append(angle)
-                
-                if angle < 90:
-                    scores['kneeling'] += 1
-                    details.append(f"{leg_name}-bent:{angle:.0f}°")
-                elif angle < 130:
-                    scores['sitting'] += 1
-                    details.append(f"{leg_name}-sit:{angle:.0f}°")
-                else:
-                    scores['standing'] += 1
-                    details.append(f"{leg_name}-ext:{angle:.0f}°")
-        
-        if leg_angles:
-            avg_angle = np.mean(leg_angles)
-            if avg_angle < 100:
-                scores['kneeling'] += 1
-            elif avg_angle < 140:
-                scores['sitting'] += 1
-        
-        return {'scores': scores, 'details': details}
-    
-    def analyze_head_body_positions(self, keypoints, threshold):
-        """Analyze head and body vertical positions"""
-        scores = {'lying': 0, 'standing': 0, 'sitting': 0, 'kneeling': 0}
-        details = []
-        
-        head_y = keypoints[0][1] if keypoints[0][2] > threshold else None
-        shoulders_y = []
-        hips_y = []
-        
-        for idx in [5, 6]:
-            if keypoints[idx][2] > threshold:
-                shoulders_y.append(keypoints[idx][1])
-        
-        for idx in [11, 12]:
-            if keypoints[idx][2] > threshold:
-                hips_y.append(keypoints[idx][1])
-        
-        if head_y is not None and shoulders_y and hips_y:
-            shoulder_avg = np.mean(shoulders_y)
-            hip_avg = np.mean(hips_y)
-            if abs(head_y - shoulder_avg) < abs(hip_avg - shoulder_avg) * 0.3:
-                scores['lying'] += 1
-                details.append("compact-vertical")
-            elif head_y < shoulder_avg < hip_avg:
-                scores['standing'] += 1
-                details.append("stacked-vertical")
-        
-        return {'scores': scores, 'details': details}
-    
-    def calculate_angle(self, p1, p2, p3):
-        """Calculate angle between three points"""
-        try:
-            v1 = np.array([p1[0] - p2[0], p1[1] - p2[1]])
-            v2 = np.array([p3[0] - p2[0], p3[1] - p2[1]])
-            norm1, norm2 = np.linalg.norm(v1), np.linalg.norm(v2)
-            if norm1 == 0 or norm2 == 0:
-                return 180
-            cos_angle = np.dot(v1, v2) / (norm1 * norm2)
-            cos_angle = np.clip(cos_angle, -1, 1)
-            angle = np.arccos(cos_angle)
-            return np.degrees(angle)
-        except:
-            return 180
+    # Phương thức classify_pose_flexible cũ trong class đã được loại bỏ/comment nếu có
     
     def draw_keypoints(self, img, keypoints, pose_label, person_id):
-        """Draw keypoints and skeleton with better visibility"""
+        """Draw keypoints và skeleton lên ảnh, kèm nhãn tư thế."""
         img_copy = img.copy()
         skeleton = [
             [16, 14], [14, 12], [17, 15], [15, 13], [12, 13],
@@ -490,8 +394,8 @@ class AdvancedPoseGUI:
                     cv2.putText(img_copy, f"{conf:.2f}", (int(x)+8, int(y)-8),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 255), 1)
         
-        # Draw bounding box + aspect ratio for debug
-        visible_points = [(x, y) for x, y, conf in keypoints if conf > draw_threshold]
+        # Draw bounding box + aspect ratio cho debug
+        visible_points = [(x, y) for x, y, c in keypoints if c > draw_threshold]
         if len(visible_points) > 2:
             x_coords = [p[0] for p in visible_points]
             y_coords = [p[1] for p in visible_points]
@@ -530,7 +434,6 @@ class AdvancedPoseGUI:
                     ("All files", "*.*")
                 ]
             )
-            
             if file_path:
                 cv2.imwrite(file_path, self.processed_image)
                 self.log_result(f"Image saved to: {file_path}")
@@ -539,11 +442,14 @@ class AdvancedPoseGUI:
             messagebox.showwarning("Warning", "No processed image to save!")
     
     def log_result(self, message):
-        """Add message to results text area"""
+        """Thêm message vào textbox kết quả"""
         self.results_text.insert(tk.END, f"{message}\n")
         self.results_text.see(tk.END)
 
-# Main application
+
+# =======================
+# 3) Phần chạy chính
+# =======================
 if __name__ == "__main__":
     root = tk.Tk()
     app = AdvancedPoseGUI(root)
@@ -567,8 +473,8 @@ if __name__ == "__main__":
     help_menu.add_command(label="About", 
                          command=lambda: messagebox.showinfo("About", 
                                                             "YOLOv8 Pose Estimation\n"
-                                                            "Phân loại tư thế: Đứng, Ngồi, Nằm, Quỳ\n"
+                                                            "Phân loại tư thế: Đứng hoặc Nằm\n"
                                                             "Sử dụng Ultralytics YOLOv8\n"
-                                                            "Improved flexible keypoint detection"))
+                                                            "Hàm phân loại tư thế đơn giản"))
     
     root.mainloop()
